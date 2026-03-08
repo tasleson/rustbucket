@@ -1,4 +1,4 @@
-<img width="768" height="768" alt="rb" src="https://github.com/user-attachments/assets/e9f0a502-2ff4-45eb-b255-96ed12545088" />
+<img width="512" height="512" alt="rb2" src="https://github.com/user-attachments/assets/dd06005a-5d39-4966-abeb-f7dad2874be9" />
 
 A simple Rust implementation of the classic **large-scale sorting benchmarks** that once pushed entire storage systems to their limits.
 
@@ -65,11 +65,6 @@ consistent sort rate of more than a million records per second.
 ```
 
 ---
-
-### What This Project Does
-
-RustSortBench implements a **modern external merge sort** designed for large datasets.
-
 
 ### Status
 Early days of getting things working.  I'll post some results when things look good.
