@@ -1,8 +1,8 @@
-<img width="512" height="512" alt="rb2" src="https://github.com/user-attachments/assets/dd06005a-5d39-4966-abeb-f7dad2874be9" />
+<img width="512" height="512" alt="rust_bucket" src="https://github.com/user-attachments/assets/46a3d3a0-0751-4c08-a20e-a513b5573ff4" />
 
-A simple Rust implementation of the classic **large-scale sorting benchmarks** that once pushed entire storage systems to their limits.
-
-The goal is to revisit those benchmarks on **modern hardware** and see how much storage performance has improved.
+A simple Rust implementation of the classic **large-scale sorting benchmarks** that once pushed
+entire storage systems to their limits. The goal is to revisit those benchmarks on **modern hardware**
+and see how much storage performance has improved.
 
 ---
 
