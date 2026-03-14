@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::alloc::{alloc, dealloc, Layout};
+use memmap2::{MmapMut, MmapOptions};
 use std::path::PathBuf;
 
 mod create;
@@ -8,57 +8,75 @@ mod sort;
 mod verify;
 
 pub const RECORD_SIZE: usize = 128;
+pub const ALIGNMENT: usize = 16384;
 
 /// Page-aligned buffer suitable for O_DIRECT and io_uring.
 pub struct AlignedBuf {
-    ptr: *mut u8,
-    layout: Layout,
+    mmap: MmapMut,
+    size: usize,
     capacity: usize,
+}
+
+fn align_up(v: usize, align: usize) -> usize {
+    (v + align - 1) & !(align - 1)
 }
 
 impl AlignedBuf {
     pub fn new(size: usize) -> Self {
-        let layout = Layout::from_size_align(size, 4096).expect("invalid layout");
-        let ptr = unsafe { alloc(layout) };
-        assert!(!ptr.is_null(), "aligned allocation failed");
-        AlignedBuf {
-            ptr,
-            layout,
-            capacity: size,
+        let aligned_size = align_up(size, ALIGNMENT);
+
+        // This should give us page aligned memory, eg. 4k or 16k etc.
+        let mut mmap = MmapOptions::new()
+            .len(aligned_size)
+            .populate()
+            .map_anon()
+            .unwrap();
+
+        unsafe {
+            libc::madvise(
+                mmap.as_mut_ptr() as *mut _,
+                aligned_size,
+                libc::MADV_HUGEPAGE,
+            );
+
+            libc::madvise(
+                mmap.as_mut_ptr() as *mut _,
+                aligned_size,
+                libc::MADV_DONTDUMP,
+            );
+        }
+
+        Self {
+            mmap,
+            size,
+            capacity: aligned_size,
         }
     }
 
-    pub fn as_ptr(&self) -> *const u8 {
-        self.ptr
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.mmap[..self.size]
+    }
+
+    pub fn as_slice(&mut self) -> &[u8] {
+        &self.mmap[..self.size]
+    }
+
+    pub fn as_slice_range(&mut self, size: usize) -> &[u8] {
+        &self.mmap[..size]
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr
+        self.mmap.as_mut_ptr()
     }
 
-    pub fn as_slice(&self, len: usize) -> &[u8] {
-        assert!(len <= self.capacity);
-        unsafe { std::slice::from_raw_parts(self.ptr, len) }
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.capacity) }
+    pub fn as_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 }
-
-impl Drop for AlignedBuf {
-    fn drop(&mut self) {
-        unsafe { dealloc(self.ptr, self.layout) }
-    }
-}
-
-// SAFETY: AlignedBuf owns its allocation; no aliasing can occur from safe code.
-unsafe impl Send for AlignedBuf {}
-unsafe impl Sync for AlignedBuf {}
 
 #[derive(Parser)]
 #[command(

@@ -14,15 +14,26 @@ use crate::{AlignedBuf, RECORD_SIZE};
 // ── tunables ──────────────────────────────────────────────────────────────────
 
 /// Read buffer for the scatter phase (per buffer; two are allocated).
-/// Must be a multiple of RECORD_SIZE and large enough to amortise syscall overhead.
 const SCATTER_READ_BUF: usize = 64 * 1024 * 1024; // 64 MiB
 
-/// BufWriter capacity per bin file during scatter.  Kept small so total
-/// bin-buffer memory ≈ num_bins × BIN_WRITE_BUF stays well under the limit.
+/// BufWriter capacity per bin file during scatter.
 const BIN_WRITE_BUF_MAX: usize = 4 * 1024 * 1024; // 4 MiB ceiling per bin
 
 /// Chunk size for io_uring writes during the gather phase.
 const GATHER_WRITE_CHUNK: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Chunk size per io_uring read op when loading a bin file.
+const BIN_READ_CHUNK: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// io_uring queue depth for bin reads.
+const BIN_QUEUE_DEPTH: u32 = 64;
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+#[inline]
+fn round_up(n: usize, align: usize) -> usize {
+    (n + align - 1) & !(align - 1)
+}
 
 // ── record key helpers ────────────────────────────────────────────────────────
 
@@ -33,7 +44,6 @@ fn record_key(rec: &[u8; RECORD_SIZE]) -> u128 {
 
 #[inline]
 fn bin_for_key(key: u128, num_bins: usize) -> usize {
-    // num_bins is always a power of two ≥ 2.
     let shift = 128 - num_bins.ilog2();
     (key >> shift) as usize
 }
@@ -41,20 +51,28 @@ fn bin_for_key(key: u128, num_bins: usize) -> usize {
 // ── bin count / size calculation ──────────────────────────────────────────────
 
 fn compute_num_bins(file_size: u64, memory_limit: u64) -> usize {
-    // Reserve 75 % of memory for a single in-memory bin during the sort phase.
     let usable = ((memory_limit as f64) * 0.75) as u64;
     let usable = usable.max(RECORD_SIZE as u64 * 2);
-    // Minimum bins so that each bin fits in usable memory.
     let min_bins = file_size.div_ceil(usable).max(2) as usize;
-    // Round up to next power of two for simple key-based routing.
     min_bins.next_power_of_two()
 }
 
 fn bin_write_buf_size(num_bins: usize, memory_limit: u64) -> usize {
-    // Allocate at most 25 % of memory across all bin write buffers.
     let total = (memory_limit / 4) as usize;
     let per = total / num_bins;
     per.clamp(RECORD_SIZE * 64, BIN_WRITE_BUF_MAX)
+}
+
+// ── io_uring ring helper ──────────────────────────────────────────────────────
+
+/// Build an io_uring ring, preferring SQPOLL to eliminate submission syscalls.
+/// Falls back to a plain ring if SQPOLL is unavailable (needs CAP_SYS_NICE on
+/// kernels < 5.12).
+fn build_ring(depth: u32) -> IoUring {
+    IoUring::builder()
+        .setup_sqpoll(2000)
+        .build(depth)
+        .unwrap_or_else(|_| IoUring::new(depth).expect("failed to create io_uring"))
 }
 
 // ── scatter phase ─────────────────────────────────────────────────────────────
@@ -100,13 +118,11 @@ fn scatter(
 ) -> Result<(Vec<BinWriter>, u64)> {
     let pid = std::process::id();
 
-    // Open input with O_DIRECT to bypass page cache for large sequential reads.
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECT)
         .open(input)
         .or_else(|_| {
-            // Fall back if O_DIRECT is not supported (e.g. on tmpfs).
             eprintln!("  Warning: O_DIRECT unavailable, falling back to buffered reads");
             OpenOptions::new().read(true).open(input)
         })
@@ -129,13 +145,13 @@ fn scatter(
     );
 
     let fd = types::Fd(file.as_raw_fd());
-    let mut ring = IoUring::new(4).context("io_uring for scatter")?;
+    // SQPOLL eliminates submission syscalls during the sequential double-buffer loop.
+    let mut ring = build_ring(4);
 
-    // Two aligned read buffers.
     let buf_size = SCATTER_READ_BUF - (SCATTER_READ_BUF % RECORD_SIZE);
+    // AlignedBuf::new now pre-faults pages so DMA doesn't trigger inline faults.
     let mut bufs = [AlignedBuf::new(buf_size), AlignedBuf::new(buf_size)];
 
-    // Create all bin writers, distributed round-robin across scratch dirs.
     let mut bin_writers: Vec<BinWriter> = (0..num_bins)
         .map(|i| {
             let dir = &scratch_dirs[i % scratch_dirs.len()];
@@ -144,10 +160,8 @@ fn scatter(
         })
         .collect::<Result<_>>()?;
 
-    // ── io_uring double-buffer read loop ───────────────────────────────────
     let read_size = |off: u64| -> u32 { (buf_size as u64).min(file_size - off) as u32 };
 
-    // Submit first read.
     {
         let rs = read_size(0);
         let sqe = opcode::Read::new(fd, bufs[0].as_mut_ptr(), rs)
@@ -171,7 +185,6 @@ fn scatter(
             break;
         }
 
-        // Wait for the in-flight read to complete.
         ring.submit_and_wait(1).context("scatter: wait read")?;
         let cqe = ring.completion().next().expect("expected cqe");
         if cqe.result() < 0 {
@@ -183,8 +196,6 @@ fn scatter(
         let bytes_read = cqe.result() as usize;
         have_inflight = false;
 
-        // Submit the next read into the OTHER buffer before processing,
-        // so disk I/O and CPU routing overlap.
         let next = 1 - current;
         if inflight_offset < file_size {
             let rs = read_size(inflight_offset);
@@ -197,8 +208,7 @@ fn scatter(
             have_inflight = true;
         }
 
-        // Route every record in the current buffer to its bin.
-        let buf = bufs[current].as_slice(bytes_read);
+        let buf = bufs[current].as_slice_range(bytes_read);
         let num_recs = bytes_read / RECORD_SIZE;
         for i in 0..num_recs {
             let rec = &buf[i * RECORD_SIZE..(i + 1) * RECORD_SIZE];
@@ -222,7 +232,6 @@ fn scatter(
         }
     }
 
-    // Flush all bin writers to disk.
     for bw in &mut bin_writers {
         bw.flush()?;
     }
@@ -237,10 +246,95 @@ fn scatter(
     Ok((bin_writers, processed))
 }
 
+// ── bin read ──────────────────────────────────────────────────────────────────
+
+/// Read the entire file at `path` into `buf` using io_uring with O_DIRECT.
+///
+/// Accepts a caller-supplied `AlignedBuf` so the same pre-faulted memory can
+/// be reused across multiple bin reads.  The first time a buf is used its pages
+/// are already hot (pre-faulted in `AlignedBuf::new`); subsequent calls into
+/// the same buf pay zero page-fault overhead.
+///
+/// Returns the number of valid bytes written (== file size).
+fn fill_buf_uring_direct(path: &Path, buf: &mut AlignedBuf) -> Result<usize> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+
+    let file_size = file.metadata()?.len() as usize;
+    let padded_size = round_up(file_size, 4096);
+
+    anyhow::ensure!(
+        padded_size <= buf.capacity(),
+        "bin file ({} B) exceeds buffer capacity ({} B); increase memory budget",
+        file_size,
+        buf.capacity()
+    );
+
+    let mut ring = build_ring(BIN_QUEUE_DEPTH);
+    ring.submitter()
+        .register_files(&[file.as_raw_fd()])
+        .context("register_files")?;
+    let fixed_fd = types::Fixed(0);
+
+    let buf_ptr = buf.as_mut_ptr();
+    let mut submit_offset = 0usize;
+    let mut in_flight: u32 = 0;
+
+    loop {
+        {
+            let mut sq = ring.submission();
+            while in_flight < BIN_QUEUE_DEPTH && submit_offset < file_size {
+                let raw_size = BIN_READ_CHUNK.min(file_size - submit_offset);
+                // O_DIRECT: transfer size must be 4096-aligned.  The extra bytes
+                // for the last chunk land in the padding region (capacity >
+                // file_size) and are never exposed to callers.
+                let io_size = round_up(raw_size, 4096);
+
+                // SAFETY: submit_offset is a multiple of BIN_READ_CHUNK (itself
+                // 4096-aligned), satisfying O_DIRECT alignment.
+                // submit_offset + io_size <= padded_size <= buf.capacity().
+                let slice_ptr = unsafe { buf_ptr.add(submit_offset) };
+
+                let entry = opcode::Read::new(fixed_fd, slice_ptr, io_size as u32)
+                    .offset(submit_offset as u64)
+                    .build()
+                    .user_data(submit_offset as u64);
+
+                if unsafe { sq.push(&entry).is_err() } {
+                    break;
+                }
+                submit_offset += raw_size;
+                in_flight += 1;
+            }
+        }
+
+        if in_flight == 0 {
+            break;
+        }
+
+        ring.submit_and_wait(1)
+            .context("fill_buf: submit_and_wait")?;
+
+        for cqe in ring.completion() {
+            if cqe.result() < 0 {
+                anyhow::bail!(
+                    "read failed at offset {}: {}",
+                    cqe.user_data(),
+                    std::io::Error::from_raw_os_error(-cqe.result())
+                );
+            }
+            in_flight -= 1;
+        }
+    }
+
+    Ok(file_size)
+}
+
 // ── sort + gather phase ───────────────────────────────────────────────────────
 
-/// Write `data` to `fd` starting at `output_offset` using io_uring, in chunks.
-/// Returns the number of bytes written.
 fn uring_write_all(
     ring: &mut IoUring,
     fd: types::Fd,
@@ -271,7 +365,7 @@ fn uring_write_all(
     Ok(())
 }
 
-fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, memory_limit: u64) -> Result<u64> {
+fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64) -> Result<u64> {
     let output_file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -280,88 +374,159 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, memory_limit: u64) 
         .context("create output file")?;
 
     let output_fd = types::Fd(output_file.as_raw_fd());
-    let mut ring = IoUring::new(4).context("io_uring for gather")?;
+    let mut ring = build_ring(4);
     let mut output_offset = 0u64;
 
-    // Pipeline: a background thread reads + sorts the NEXT bin while this
-    // thread writes the CURRENT bin.  Channel capacity = 1 so at most one
-    // pre-sorted bin is buffered in memory (respects the memory limit).
-    let (tx, rx) = bounded::<Vec<u8>>(1);
+    // Size pooled buffers for the largest ACTUAL bin, computed from the scatter
+    // phase record counts.  Using memory_limit * 0.75 is wrong: it is an average
+    // bound, but random key distribution means individual bins can exceed it.
+    // We already know exact sizes — use them instead of estimating.
+    let max_bin_bytes = round_up(
+        bin_writers
+            .iter()
+            .map(|bw| bw.records as usize * RECORD_SIZE)
+            .max()
+            .unwrap_or(RECORD_SIZE),
+        4096,
+    );
+
+    // Two AlignedBufs for double-buffering the sort-gather pipeline:
+    //   - sorter reads+sorts bin N into buf_a and sends it to the writer
+    //   - while the writer writes buf_a, the sorter reads+sorts bin N+1 into buf_b
+    //   - writer returns buf_a to the pool; sorter uses it for bin N+2
+    //
+    // AlignedBuf::new pre-faults all pages once.  Every subsequent read into
+    // these bufs (bin 1, bin 2, …) pays zero page-fault overhead — the same
+    // principle as readfast's FileReader.
+    let (sorted_tx, sorted_rx) = bounded::<(AlignedBuf, usize)>(1); // sorter → writer
+    let (free_tx, free_rx) = bounded::<AlignedBuf>(2); // writer → sorter (pool)
+
+    free_tx
+        .send(AlignedBuf::new(max_bin_bytes))
+        .expect("send buf 0");
+    free_tx
+        .send(AlignedBuf::new(max_bin_bytes))
+        .expect("send buf 1");
 
     let bin_paths: Vec<PathBuf> = bin_writers.iter().map(|b| b.path.clone()).collect();
     let bin_record_counts: Vec<u64> = bin_writers.iter().map(|b| b.records).collect();
 
-    // Sorter thread.
     let sorter = std::thread::spawn(move || -> Result<()> {
+        let mut total_read = std::time::Duration::ZERO;
+        let mut total_sort = std::time::Duration::ZERO;
+        let mut total_send_wait = std::time::Duration::ZERO;
+
         for (idx, path) in bin_paths.iter().enumerate() {
             let count = bin_record_counts[idx];
             if count == 0 {
-                tx.send(Vec::new()).ok();
-                continue;
+                continue; // writer also skips empty bins; no sentinel needed
             }
 
-            // Read the entire bin into memory.
-            let mut data = {
-                let f = File::open(path).with_context(|| format!("open bin {}", path.display()))?;
-                let sz = f.metadata()?.len() as usize;
-                let mut v = vec![0u8; sz];
-                let mut f = std::io::BufReader::with_capacity(64 * 1024 * 1024, f);
-                std::io::Read::read_exact(&mut f, &mut v)
-                    .with_context(|| format!("read bin {}", path.display()))?;
-                v
-            };
+            // Grab a pre-faulted buffer from the pool.  Blocks if the writer
+            // hasn't finished with the previous one yet (backpressure).
+            let mut buf = free_rx.recv().context("buffer pool closed")?;
 
-            // Sort in-place as an array of fixed-size records using rayon.
-            // SAFETY: data.len() is a multiple of RECORD_SIZE (we only wrote
-            // whole records); [u8; RECORD_SIZE] has the same layout as RECORD_SIZE
-            // consecutive u8s.
+            let t_read = Instant::now();
+            let bytes_read = fill_buf_uring_direct(path, &mut buf)?;
+            let read_elapsed = t_read.elapsed();
+            total_read += read_elapsed;
+
+            let t_sort = Instant::now();
             {
-                let records: &mut [[u8; RECORD_SIZE]] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        data.as_mut_ptr() as *mut [u8; RECORD_SIZE],
-                        data.len() / RECORD_SIZE,
-                    )
-                };
+                let data = &mut buf.as_mut_slice()[..bytes_read];
+                let (records, remainder) = data.as_chunks_mut::<RECORD_SIZE>();
+                assert!(remainder.is_empty());
                 records.par_sort_unstable_by_key(record_key);
             }
+            let sort_elapsed = t_sort.elapsed();
+            total_sort += sort_elapsed;
 
-            tx.send(data).ok();
+            eprintln!(
+                "  [sorter] bin {:>4}: {:.1} MiB  read {:.3}s  sort {:.3}s",
+                idx,
+                bytes_read as f64 / (1u64 << 20) as f64,
+                read_elapsed.as_secs_f64(),
+                sort_elapsed.as_secs_f64()
+            );
+
+            let t_send = Instant::now();
+            sorted_tx.send((buf, bytes_read)).ok();
+            total_send_wait += t_send.elapsed();
         }
+
+        eprintln!(
+            "  [sorter] totals: read {:.3}s  sort {:.3}s  blocked-on-writer {:.3}s",
+            total_read.as_secs_f64(),
+            total_sort.as_secs_f64(),
+            total_send_wait.as_secs_f64()
+        );
         Ok(())
     });
 
     let start = Instant::now();
     let total_records: u64 = bin_writers.iter().map(|b| b.records).sum();
     let mut written_records = 0u64;
+    let mut total_recv_wait = std::time::Duration::ZERO;
+    let mut total_write_time = std::time::Duration::ZERO;
 
     eprintln!("Gather: writing {} sorted records to output", total_records);
 
     for bw in bin_writers {
-        let data = rx.recv().context("sorter thread closed channel early")?;
-        if data.is_empty() {
-            continue;
+        if bw.records == 0 {
+            continue; // sorter also skips empty bins
         }
 
-        uring_write_all(&mut ring, output_fd, &data, &mut output_offset)?;
+        let t_recv = Instant::now();
+        let (mut buf, bytes) = match sorted_rx.recv() {
+            Ok(v) => v,
+            Err(_) => {
+                // Channel closed early — the sorter hit an error.  Join it now
+                // to surface the real failure rather than "disconnected channel".
+                return match sorter.join() {
+                    Ok(Err(e)) => Err(e.context("sorter thread failed")),
+                    Ok(Ok(())) => anyhow::bail!("sorter finished early without sending all bins"),
+                    Err(_) => anyhow::bail!("sorter thread panicked"),
+                };
+            }
+        };
+        let recv_wait = t_recv.elapsed();
+        total_recv_wait += recv_wait;
 
-        written_records += data.len() as u64 / RECORD_SIZE as u64;
+        let t_write = Instant::now();
+        uring_write_all(
+            &mut ring,
+            output_fd,
+            buf.as_slice_range(bytes),
+            &mut output_offset,
+        )?;
+        let write_elapsed = t_write.elapsed();
+        total_write_time += write_elapsed;
 
-        // Delete the bin file as soon as it has been consumed.
+        written_records += bytes as u64 / RECORD_SIZE as u64;
+
+        // Return the buffer to the pool so the sorter can reuse it for the next bin.
+        free_tx.send(buf).ok();
+
         if let Err(e) = fs::remove_file(&bw.path) {
             eprintln!("  Warning: could not remove {}: {}", bw.path.display(), e);
         }
 
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
-            "  gather {:.1}%  {:.0} MiB/s",
+            "  gather {:.1}%  {:.0} MiB/s  (blocked-on-sorter {:.3}s  write {:.3}s)",
             100.0 * written_records as f64 / total_records as f64,
-            output_offset as f64 / secs / (1u64 << 20) as f64
+            output_offset as f64 / secs / (1u64 << 20) as f64,
+            recv_wait.as_secs_f64(),
+            write_elapsed.as_secs_f64(),
         );
     }
 
-    let _ = memory_limit; // used by caller for bin count; not needed here
+    eprintln!(
+        "  [gather] totals: blocked-on-sorter {:.3}s  write {:.3}s",
+        total_recv_wait.as_secs_f64(),
+        total_write_time.as_secs_f64()
+    );
 
-    // Propagate any error from the sorter thread.
     sorter.join().expect("sorter thread panicked")?;
 
     let secs = start.elapsed().as_secs_f64();
@@ -424,11 +589,10 @@ pub fn sort_file(
     );
 
     let total_secs = wall.elapsed().as_secs_f64();
-    let total_bytes = file_size as f64;
     eprintln!(
         "Total: {:.1}s  effective throughput {:.0} MiB/s (based on input size)",
         total_secs,
-        total_bytes / total_secs / (1u64 << 20) as f64
+        file_size as f64 / total_secs / (1u64 << 20) as f64
     );
 
     Ok(())

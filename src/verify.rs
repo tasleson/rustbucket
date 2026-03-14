@@ -47,7 +47,10 @@ pub fn verify_file(path: &Path) -> Result<bool> {
     }
 
     let fd = types::Fd(file.as_raw_fd());
-    let mut ring = IoUring::new(4).context("io_uring")?;
+    let mut ring = IoUring::builder()
+        .setup_sqpoll(2000)
+        .build(4)
+        .unwrap_or_else(|_| IoUring::new(4).expect("io_uring"));
 
     let buf_size = READ_BUF_SIZE - (READ_BUF_SIZE % RECORD_SIZE);
     let mut bufs = [AlignedBuf::new(buf_size), AlignedBuf::new(buf_size)];
@@ -107,7 +110,7 @@ pub fn verify_file(path: &Path) -> Result<bool> {
         }
 
         // Check each record in this buffer.
-        let buf = bufs[current].as_slice(bytes_read);
+        let buf = bufs[current].as_slice_range(bytes_read);
         let num_recs = bytes_read / RECORD_SIZE;
         for i in 0..num_recs {
             let key = key_of(&buf[i * RECORD_SIZE..]);

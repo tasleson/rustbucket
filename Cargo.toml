@@ -11,10 +11,11 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1"
-io-uring = "0.6"
+io-uring = "0.7"
 anyhow = "1"
 libc = "0.2"
 crossbeam-channel = "0.5"
+memmap2 = "0.9"
 
 [profile.release]
 opt-level = 3
