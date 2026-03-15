@@ -17,7 +17,7 @@ use crate::{AlignedBuf, RECORD_SIZE};
 const SCATTER_READ_BUF: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// BufWriter capacity per bin file during scatter.
-const BIN_WRITE_BUF_MAX: usize = 4 * 1024 * 1024; // 4 MiB ceiling per bin
+const BIN_WRITE_BUF_MAX: usize = 8 * 1024 * 1024; // 4 MiB ceiling per bin
 
 /// Chunk size for io_uring writes during the gather phase.
 const GATHER_WRITE_CHUNK: usize = 64 * 1024 * 1024; // 64 MiB
@@ -37,10 +37,10 @@ fn round_up(n: usize, align: usize) -> usize {
 
 // ── record key helpers ────────────────────────────────────────────────────────
 
-#[inline]
-fn record_key(rec: &[u8; RECORD_SIZE]) -> u128 {
-    u128::from_le_bytes(rec[..16].try_into().unwrap())
-}
+//#[inline]
+//fn record_key(rec: &[u8; RECORD_SIZE]) -> u128 {
+//    u128::from_le_bytes(rec[..16].try_into().unwrap())
+//}
 
 #[inline]
 fn bin_for_key(key: u128, num_bins: usize) -> usize {
@@ -365,6 +365,13 @@ fn uring_write_all(
     Ok(())
 }
 
+#[inline(always)]
+fn record_cmp(a: &[u8; 128], b: &[u8; 128]) -> std::cmp::Ordering {
+    let ka = unsafe { std::ptr::read_unaligned(a.as_ptr() as *const u128) };
+    let kb = unsafe { std::ptr::read_unaligned(b.as_ptr() as *const u128) };
+    ka.cmp(&kb)
+}
+
 fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64) -> Result<u64> {
     let output_file = OpenOptions::new()
         .write(true)
@@ -373,9 +380,13 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
         .open(output)
         .context("create output file")?;
 
+    let estart = Instant::now();
+
     let output_fd = types::Fd(output_file.as_raw_fd());
     let mut ring = build_ring(4);
     let mut output_offset = 0u64;
+
+    println!("DEBUG: build_ring {:?}", estart.elapsed());
 
     // Size pooled buffers for the largest ACTUAL bin, computed from the scatter
     // phase record counts.  Using memory_limit * 0.75 is wrong: it is an average
@@ -390,16 +401,21 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
         4096,
     );
 
-    // Two AlignedBufs for double-buffering the sort-gather pipeline:
-    //   - sorter reads+sorts bin N into buf_a and sends it to the writer
-    //   - while the writer writes buf_a, the sorter reads+sorts bin N+1 into buf_b
-    //   - writer returns buf_a to the pool; sorter uses it for bin N+2
+    println!("DEBUG: max_bin_bytes found {:?}", estart.elapsed());
+
+    // Three AlignedBufs for triple-buffering: read one, sort one, write one.
+    //   - reader thread: reads bin N+1 from disk into buf_a
+    //   - sorter thread: sorts bin N in buf_b
+    //   - writer thread: writes bin N-1 from buf_c
+    //   All three operations happen concurrently.
     //
     // AlignedBuf::new pre-faults all pages once.  Every subsequent read into
-    // these bufs (bin 1, bin 2, …) pays zero page-fault overhead — the same
-    // principle as readfast's FileReader.
-    let (sorted_tx, sorted_rx) = bounded::<(AlignedBuf, usize)>(1); // sorter → writer
-    let (free_tx, free_rx) = bounded::<AlignedBuf>(2); // writer → sorter (pool)
+    // these bufs pays zero page-fault overhead.
+    let (read_tx, read_rx) = bounded::<(AlignedBuf, usize, usize)>(1); // reader → sorter: (buf, bytes, idx)
+    let (sorted_tx, sorted_rx) = bounded::<(AlignedBuf, usize, usize)>(1); // sorter → writer: (buf, bytes, idx)
+    let (free_tx, free_rx) = bounded::<AlignedBuf>(3); // writer → reader (pool)
+
+    println!("DEBUG: 3 threads created {:?}", estart.elapsed());
 
     free_tx
         .send(AlignedBuf::new(max_bin_bytes))
@@ -407,58 +423,119 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
     free_tx
         .send(AlignedBuf::new(max_bin_bytes))
         .expect("send buf 1");
+    free_tx
+        .send(AlignedBuf::new(max_bin_bytes))
+        .expect("send buf 2");
+
+    println!(
+        "DEBUG: buffers created and sent to threads {:?}",
+        estart.elapsed()
+    );
 
     let bin_paths: Vec<PathBuf> = bin_writers.iter().map(|b| b.path.clone()).collect();
+    println!("DEBUG: bin_paths found {:?}", estart.elapsed());
+
     let bin_record_counts: Vec<u64> = bin_writers.iter().map(|b| b.records).collect();
+    println!(
+        "DEBUG: bin_record_counts calculated {:?} {:?}",
+        bin_record_counts,
+        estart.elapsed()
+    );
 
-    let sorter = std::thread::spawn(move || -> Result<()> {
+    // Reader thread: read bins from disk
+    let reader_paths = bin_paths.clone();
+    let reader_counts = bin_record_counts.clone();
+    let reader = std::thread::spawn(move || -> Result<()> {
         let mut total_read = std::time::Duration::ZERO;
-        let mut total_sort = std::time::Duration::ZERO;
-        let mut total_send_wait = std::time::Duration::ZERO;
+        let mut total_wait_pool = std::time::Duration::ZERO;
+        let mut total_wait_send = std::time::Duration::ZERO;
 
-        for (idx, path) in bin_paths.iter().enumerate() {
-            let count = bin_record_counts[idx];
+        for (idx, path) in reader_paths.iter().enumerate() {
+            let count = reader_counts[idx];
             if count == 0 {
-                continue; // writer also skips empty bins; no sentinel needed
+                continue;
             }
 
-            // Grab a pre-faulted buffer from the pool.  Blocks if the writer
-            // hasn't finished with the previous one yet (backpressure).
+            let t_wait = Instant::now();
             let mut buf = free_rx.recv().context("buffer pool closed")?;
+            let wait_pool = t_wait.elapsed();
+            total_wait_pool += wait_pool;
 
             let t_read = Instant::now();
             let bytes_read = fill_buf_uring_direct(path, &mut buf)?;
             let read_elapsed = t_read.elapsed();
             total_read += read_elapsed;
 
+            let t_send = Instant::now();
+            read_tx.send((buf, bytes_read, idx)).ok();
+            let wait_send = t_send.elapsed();
+            total_wait_send += wait_send;
+
+            eprintln!(
+                "  [reader] bin {:>4}: {:.1} MiB  read {:.3}s  wait-pool {:.3}s  wait-sorter {:.3}s",
+                idx,
+                bytes_read as f64 / (1u64 << 20) as f64,
+                read_elapsed.as_secs_f64(),
+                wait_pool.as_secs_f64(),
+                wait_send.as_secs_f64()
+            );
+        }
+
+        eprintln!(
+            "  [reader] totals: read {:.3}s  wait-pool {:.3}s  wait-sorter {:.3}s",
+            total_read.as_secs_f64(),
+            total_wait_pool.as_secs_f64(),
+            total_wait_send.as_secs_f64()
+        );
+        Ok(())
+    });
+
+    // Sorter thread: sort bins
+    let sorter = std::thread::spawn(move || -> Result<()> {
+        let mut total_sort = std::time::Duration::ZERO;
+        let mut total_wait_reader = std::time::Duration::ZERO;
+        let mut total_wait_writer = std::time::Duration::ZERO;
+
+        loop {
+            let t_wait = Instant::now();
+            let (mut buf, bytes_read, idx) = match read_rx.recv() {
+                Ok(v) => v,
+                Err(_) => break, // reader finished
+            };
+            let wait_reader = t_wait.elapsed();
+            total_wait_reader += wait_reader;
+
             let t_sort = Instant::now();
             {
                 let data = &mut buf.as_mut_slice()[..bytes_read];
                 let (records, remainder) = data.as_chunks_mut::<RECORD_SIZE>();
                 assert!(remainder.is_empty());
-                records.par_sort_unstable_by_key(record_key);
+                //records.par_sort_unstable_by_key(record_key);
+                records.par_sort_unstable_by(record_cmp);
             }
             let sort_elapsed = t_sort.elapsed();
             total_sort += sort_elapsed;
 
+            let t_send = Instant::now();
+            sorted_tx.send((buf, bytes_read, idx)).ok();
+            let wait_writer = t_send.elapsed();
+            total_wait_writer += wait_writer;
+
             eprintln!(
-                "  [sorter] bin {:>4}: {:.1} MiB  read {:.3}s  sort {:.3}s",
+                "  [sorter] bin {:>4}: {:.1} MiB  sort {:.3}s  wait-reader {:.3}s  wait-writer {:.3}s",
                 idx,
                 bytes_read as f64 / (1u64 << 20) as f64,
-                read_elapsed.as_secs_f64(),
-                sort_elapsed.as_secs_f64()
+                sort_elapsed.as_secs_f64(),
+                wait_reader.as_secs_f64(),
+                wait_writer.as_secs_f64()
             );
-
-            let t_send = Instant::now();
-            sorted_tx.send((buf, bytes_read)).ok();
-            total_send_wait += t_send.elapsed();
         }
 
         eprintln!(
-            "  [sorter] totals: read {:.3}s  sort {:.3}s  blocked-on-writer {:.3}s",
-            total_read.as_secs_f64(),
+            "  [sorter] totals: sort {:.3}s  wait-reader {:.3}s  wait-writer {:.3}s",
             total_sort.as_secs_f64(),
-            total_send_wait.as_secs_f64()
+            total_wait_reader.as_secs_f64(),
+            total_wait_writer.as_secs_f64()
         );
         Ok(())
     });
@@ -466,22 +543,22 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
     let start = Instant::now();
     let total_records: u64 = bin_writers.iter().map(|b| b.records).sum();
     let mut written_records = 0u64;
-    let mut total_recv_wait = std::time::Duration::ZERO;
+    let mut total_wait_sorter = std::time::Duration::ZERO;
     let mut total_write_time = std::time::Duration::ZERO;
 
     eprintln!("Gather: writing {} sorted records to output", total_records);
 
     for bw in bin_writers {
         if bw.records == 0 {
-            continue; // sorter also skips empty bins
+            continue;
         }
 
         let t_recv = Instant::now();
-        let (mut buf, bytes) = match sorted_rx.recv() {
+        let (mut buf, bytes, idx) = match sorted_rx.recv() {
             Ok(v) => v,
             Err(_) => {
-                // Channel closed early — the sorter hit an error.  Join it now
-                // to surface the real failure rather than "disconnected channel".
+                // Channel closed early — a thread hit an error. Join them to surface it.
+                let _ = reader.join();
                 return match sorter.join() {
                     Ok(Err(e)) => Err(e.context("sorter thread failed")),
                     Ok(Ok(())) => anyhow::bail!("sorter finished early without sending all bins"),
@@ -489,8 +566,8 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
                 };
             }
         };
-        let recv_wait = t_recv.elapsed();
-        total_recv_wait += recv_wait;
+        let wait_sorter = t_recv.elapsed();
+        total_wait_sorter += wait_sorter;
 
         let t_write = Instant::now();
         uring_write_all(
@@ -504,7 +581,7 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
 
         written_records += bytes as u64 / RECORD_SIZE as u64;
 
-        // Return the buffer to the pool so the sorter can reuse it for the next bin.
+        // Return the buffer to the pool so the reader can reuse it for the next bin.
         free_tx.send(buf).ok();
 
         if let Err(e) = fs::remove_file(&bw.path) {
@@ -513,20 +590,22 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
 
         let secs = start.elapsed().as_secs_f64();
         eprintln!(
-            "  gather {:.1}%  {:.0} MiB/s  (blocked-on-sorter {:.3}s  write {:.3}s)",
+            "  [writer] bin {:>4}: {:.1}%  {:.0} MiB/s  (wait-sorter {:.3}s  write {:.3}s)",
+            idx,
             100.0 * written_records as f64 / total_records as f64,
             output_offset as f64 / secs / (1u64 << 20) as f64,
-            recv_wait.as_secs_f64(),
+            wait_sorter.as_secs_f64(),
             write_elapsed.as_secs_f64(),
         );
     }
 
     eprintln!(
-        "  [gather] totals: blocked-on-sorter {:.3}s  write {:.3}s",
-        total_recv_wait.as_secs_f64(),
+        "  [writer] totals: wait-sorter {:.3}s  write {:.3}s",
+        total_wait_sorter.as_secs_f64(),
         total_write_time.as_secs_f64()
     );
 
+    reader.join().expect("reader thread panicked")?;
     sorter.join().expect("sorter thread panicked")?;
 
     let secs = start.elapsed().as_secs_f64();

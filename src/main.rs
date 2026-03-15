@@ -26,24 +26,13 @@ impl AlignedBuf {
         let aligned_size = align_up(size, ALIGNMENT);
 
         // This should give us page aligned memory, eg. 4k or 16k etc.
-        let mut mmap = MmapOptions::new()
-            .len(aligned_size)
-            .populate()
-            .map_anon()
-            .unwrap();
+        let mut mmap = MmapOptions::new().len(aligned_size).map_anon().unwrap();
 
         unsafe {
-            libc::madvise(
-                mmap.as_mut_ptr() as *mut _,
-                aligned_size,
-                libc::MADV_HUGEPAGE,
-            );
-
-            libc::madvise(
-                mmap.as_mut_ptr() as *mut _,
-                aligned_size,
-                libc::MADV_DONTDUMP,
-            );
+            let ptr = mmap.as_mut_ptr();
+            libc::madvise(ptr as *mut _, aligned_size, libc::MADV_HUGEPAGE);
+            libc::madvise(ptr as *mut _, aligned_size, libc::MADV_DONTDUMP);
+            libc::madvise(ptr as *mut _, aligned_size, libc::MADV_WILLNEED);
         }
 
         Self {
