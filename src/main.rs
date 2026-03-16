@@ -107,6 +107,9 @@ enum Commands {
         /// Number of worker threads. 0 = use all available cores.
         #[arg(short, long, default_value = "0")]
         threads: usize,
+        /// Remove the input file after the scatter phase (before sort/gather).
+        #[arg(long, default_value = "false")]
+        remove_input: bool,
     },
 }
 
@@ -160,6 +163,7 @@ fn main() -> Result<()> {
             scratch,
             memory,
             threads,
+            remove_input,
         } => {
             let memory_bytes = parse_size(&memory)?;
             let num_threads = if threads == 0 {
@@ -173,7 +177,7 @@ fn main() -> Result<()> {
                 .num_threads(num_threads)
                 .build_global()
                 .ok();
-            sort::sort_file(&input, &output, &scratch, memory_bytes)?;
+            sort::sort_file(&input, &output, &scratch, memory_bytes, remove_input)?;
         }
     }
     Ok(())

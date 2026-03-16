@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::bounded;
 use io_uring::{opcode, types, IoUring};
 use rayon::prelude::*;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, remove_file, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
@@ -380,13 +380,9 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
         .open(output)
         .context("create output file")?;
 
-    let estart = Instant::now();
-
     let output_fd = types::Fd(output_file.as_raw_fd());
     let mut ring = build_ring(4);
     let mut output_offset = 0u64;
-
-    println!("DEBUG: build_ring {:?}", estart.elapsed());
 
     // Size pooled buffers for the largest ACTUAL bin, computed from the scatter
     // phase record counts.  Using memory_limit * 0.75 is wrong: it is an average
@@ -401,8 +397,6 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
         4096,
     );
 
-    println!("DEBUG: max_bin_bytes found {:?}", estart.elapsed());
-
     // Three AlignedBufs for triple-buffering: read one, sort one, write one.
     //   - reader thread: reads bin N+1 from disk into buf_a
     //   - sorter thread: sorts bin N in buf_b
@@ -415,8 +409,6 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
     let (sorted_tx, sorted_rx) = bounded::<(AlignedBuf, usize, usize)>(1); // sorter → writer: (buf, bytes, idx)
     let (free_tx, free_rx) = bounded::<AlignedBuf>(3); // writer → reader (pool)
 
-    println!("DEBUG: 3 threads created {:?}", estart.elapsed());
-
     free_tx
         .send(AlignedBuf::new(max_bin_bytes))
         .expect("send buf 0");
@@ -427,20 +419,9 @@ fn sort_and_gather(bin_writers: &[BinWriter], output: &Path, _memory_limit: u64)
         .send(AlignedBuf::new(max_bin_bytes))
         .expect("send buf 2");
 
-    println!(
-        "DEBUG: buffers created and sent to threads {:?}",
-        estart.elapsed()
-    );
-
     let bin_paths: Vec<PathBuf> = bin_writers.iter().map(|b| b.path.clone()).collect();
-    println!("DEBUG: bin_paths found {:?}", estart.elapsed());
 
     let bin_record_counts: Vec<u64> = bin_writers.iter().map(|b| b.records).collect();
-    println!(
-        "DEBUG: bin_record_counts calculated {:?} {:?}",
-        bin_record_counts,
-        estart.elapsed()
-    );
 
     // Reader thread: read bins from disk
     let reader_paths = bin_paths.clone();
@@ -625,6 +606,7 @@ pub fn sort_file(
     output: &Path,
     scratch_dirs: &[PathBuf],
     memory_limit: u64,
+    remove_input: bool,
 ) -> Result<()> {
     let file_size = input
         .metadata()
@@ -655,6 +637,12 @@ pub fn sort_file(
     // Phase 1 – Scatter.
     let (bin_writers, scattered) = scatter(input, scratch_dirs, num_bins, bin_buf)?;
     eprintln!("Phase 1 done: {} records scattered", scattered);
+
+    // Remove input file if requested (after scatter, before sort/gather).
+    if remove_input {
+        remove_file(input).with_context(|| format!("remove input file {}", input.display()))?;
+        eprintln!("Input file removed: {}", input.display());
+    }
 
     // Phase 2 – Sort + Gather.
     let written = sort_and_gather(&bin_writers, output, memory_limit)?;
