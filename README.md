@@ -4,6 +4,15 @@ A simple Rust implementation of the classic **large-scale sorting benchmarks** t
 entire storage systems to their limits. The goal is to revisit those benchmarks on **modern hardware**
 and see how much storage performance has improved.
 
+## Platform Support
+
+**rustbucket** is now cross-platform with optimized implementations for different operating systems:
+
+- **Linux**: Uses `io_uring` for high-performance async I/O, O_DIRECT for bypassing page cache, and memory hints (MADV_HUGEPAGE) for optimal performance
+- **macOS/Windows**: Uses standard file I/O with the same algorithmic approach, maintaining portability while sacrificing some performance compared to Linux
+
+The Linux version provides the best performance due to io_uring's zero-copy I/O and kernel-level optimizations, but the portable version works across all platforms.
+
 ---
 
 ### A Bit of History

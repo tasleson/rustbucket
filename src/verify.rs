@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
-use io_uring::{opcode, types, IoUring};
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::{AlignedBuf, RECORD_SIZE};
+#[cfg(target_os = "linux")]
+use io_uring::{opcode, types, IoUring};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
+use crate::{io_backend, AlignedBuf, RECORD_SIZE};
 
 const READ_BUF_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
@@ -16,14 +17,9 @@ fn key_of(rec: &[u8]) -> u128 {
 }
 
 /// Returns `false` (exit code 1) if the file is not sorted, `true` (exit code 0) if it is.
+#[cfg(target_os = "linux")]
 pub fn verify_file(path: &Path) -> Result<bool> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-        .or_else(|_| OpenOptions::new().read(true).open(path))
-        .context("open file")?;
-
+    let file = io_backend::open_read_direct(path)?;
     let file_size = file.metadata()?.len();
 
     anyhow::ensure!(
@@ -128,6 +124,91 @@ pub fn verify_file(path: &Path) -> Result<bool> {
 
         checked += num_recs as u64;
         current = next;
+
+        if checked >= next_report {
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "  {:.1}%  {:.0} MiB/s",
+                100.0 * checked as f64 / total_records as f64,
+                (checked * RECORD_SIZE as u64) as f64 / secs / (1u64 << 20) as f64
+            );
+            next_report += report_step;
+        }
+    }
+
+    let secs = start.elapsed().as_secs_f64();
+    eprintln!(
+        "OK: {} records verified in {:.1}s ({:.0} MiB/s)",
+        checked,
+        secs,
+        file_size as f64 / secs / (1u64 << 20) as f64
+    );
+    Ok(true)
+}
+
+// ── Portable version ──────────────────────────────────────────────────────────
+
+#[cfg(not(target_os = "linux"))]
+pub fn verify_file(path: &Path) -> Result<bool> {
+    use std::io::Read;
+
+    let mut file = io_backend::open_read_direct(path)?;
+    let file_size = file.metadata()?.len();
+
+    anyhow::ensure!(
+        file_size % RECORD_SIZE as u64 == 0,
+        "file size ({}) is not a multiple of RECORD_SIZE ({})",
+        file_size,
+        RECORD_SIZE
+    );
+
+    let total_records = file_size / RECORD_SIZE as u64;
+    eprintln!(
+        "Verifying {} records ({:.3} GiB) in {}",
+        total_records,
+        file_size as f64 / (1u64 << 30) as f64,
+        path.display()
+    );
+
+    if total_records == 0 {
+        eprintln!("OK: file is empty");
+        return Ok(true);
+    }
+
+    let buf_size = READ_BUF_SIZE - (READ_BUF_SIZE % RECORD_SIZE);
+    let mut buf = AlignedBuf::new(buf_size);
+
+    let mut prev_key: u128 = 0;
+    let mut checked: u64 = 0;
+    let mut first = true;
+
+    let start = Instant::now();
+    let report_step = (total_records / 20).max(1);
+    let mut next_report = report_step;
+
+    loop {
+        let bytes_read = file.read(buf.as_mut_slice()).context("read file")?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let buf_data = buf.as_slice_range(bytes_read);
+        let num_recs = bytes_read / RECORD_SIZE;
+        for i in 0..num_recs {
+            let key = key_of(&buf_data[i * RECORD_SIZE..]);
+            if !first && key < prev_key {
+                let record_index = checked + i as u64;
+                eprintln!(
+                    "FAIL: record {} is out of order\n  key {:#034x}\n  prev {:#034x}",
+                    record_index, key, prev_key
+                );
+                return Ok(false);
+            }
+            prev_key = key;
+            first = false;
+        }
+
+        checked += num_recs as u64;
 
         if checked >= next_report {
             let secs = start.elapsed().as_secs_f64();

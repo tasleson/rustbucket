@@ -4,6 +4,7 @@ use memmap2::{MmapMut, MmapOptions};
 use std::path::PathBuf;
 
 mod create;
+mod io_backend;
 mod sort;
 mod verify;
 
@@ -28,6 +29,8 @@ impl AlignedBuf {
         // This should give us page aligned memory, eg. 4k or 16k etc.
         let mut mmap = MmapOptions::new().len(aligned_size).map_anon().unwrap();
 
+        // Apply platform-specific memory hints for performance
+        #[cfg(target_os = "linux")]
         unsafe {
             let ptr = mmap.as_mut_ptr();
             libc::madvise(ptr as *mut _, aligned_size, libc::MADV_HUGEPAGE);
