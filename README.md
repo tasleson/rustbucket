@@ -12,8 +12,7 @@ In the late 1990s and early 2000s, the database research community created the *
 
 Some well-known variants included:
 
-- **Daytona** – production-quality external sort
-- **PennySort** – cheapest system capable of sorting 1 TB
+- **PennySort** – Amount of data that can be sorted for a penny’s worth of system time
 - **MinuteSort** – sort as much data as possible in one minute
 - **TerabyteSort** – sort 1 TB as fast as possible
 
